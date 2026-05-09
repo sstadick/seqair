@@ -138,6 +138,7 @@ pub struct PileupEngine<U = ()> {
 struct ActiveRecord {
     record_idx: u32,
     cigar: CigarMapping,
+    cigar_cursor: usize,
     // Cached from SlimRecord to avoid store lookups in the hot loop
     flags: BamFlags,
     strand: Strand,
@@ -691,10 +692,10 @@ impl<U> PileupColumnAccumulator<U> for MaterializeColumnAccumulator {
 
 fn build_alignment<U>(
     store: &RecordStore<U>,
-    active: &ActiveRecord,
+    active: &mut ActiveRecord,
     pos: Pos0,
 ) -> Option<PileupAlignment> {
-    let info = active.cigar.pos_info_at(pos)?;
+    let info = active.cigar.pos_info_at_cursor(pos, &mut active.cigar_cursor)?;
 
     let op = match info {
         CigarPosInfo::Match { qpos } => {
@@ -996,6 +997,7 @@ impl<U> PileupEngine<U> {
                 self.active.push(ActiveRecord {
                     record_idx: idx,
                     cigar,
+                    cigar_cursor: 0,
                     flags: rec.flags,
                     strand: strand_from_flags(rec.flags),
                     mapq: rec.mapq,
@@ -1035,9 +1037,10 @@ impl<U> PileupEngine<U> {
             let max_depth = self.max_depth.map(|max| usize::try_from(max).unwrap_or(usize::MAX));
             let mut emitted_depth = 0usize;
             let mut started = false;
+            let active_upper_bound = self.active.len();
             let reference_base = self.ref_seq.as_ref().map_or(Base::Unknown, |r| r.base_at(pos));
 
-            for active in &self.active {
+            for active in &mut self.active {
                 if max_depth.is_some_and(|max| emitted_depth >= max) {
                     break;
                 }
@@ -1046,7 +1049,7 @@ impl<U> PileupEngine<U> {
 
                 if !started {
                     accumulator.begin_column(pos, reference_base);
-                    accumulator.reserve_column(self.active.len());
+                    accumulator.reserve_column(active_upper_bound);
                     started = true;
                 }
 

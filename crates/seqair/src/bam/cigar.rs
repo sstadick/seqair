@@ -386,6 +386,19 @@ impl CigarMapping {
             }
         }
     }
+
+    /// Lookup optimized for monotonic position iteration.
+    ///
+    /// `cursor` is the caller's current compact-op index for this record. When
+    /// positions are visited in non-decreasing order (as pileup does), this
+    /// avoids a linear scan / binary search on every column for complex CIGARs.
+    /// If callers might move backwards, use [`Self::pos_info_at`] instead.
+    pub fn pos_info_at_cursor(&self, pos: Pos0, cursor: &mut usize) -> Option<CigarPosInfo> {
+        match self {
+            Self::Linear { .. } => self.pos_info_at(pos),
+            Self::Complex(ops) => pos_info_cursor(ops, pos, cursor),
+        }
+    }
 }
 
 // r[impl cigar.qpos_bounds]
@@ -561,6 +574,31 @@ fn pos_info_bsearch(ops: &[CompactOp], pos: Pos0) -> Option<CigarPosInfo> {
     None
 }
 
+#[inline]
+fn pos_info_cursor(ops: &[CompactOp], pos: Pos0, cursor: &mut usize) -> Option<CigarPosInfo> {
+    let pos32 = pos.as_i32();
+
+    while let Some(op) = ops.get(*cursor) {
+        if !consumes_ref(op.op_type) {
+            *cursor = (*cursor).saturating_add(1);
+            continue;
+        }
+
+        let ref_end =
+            op.ref_start.saturating_add(i32::try_from(op.len).trace_ok("op len exceeds i32")?);
+        if pos32 < op.ref_start {
+            return None;
+        }
+        if pos32 < ref_end {
+            return classify_op(ops, *cursor, op, pos32, ref_end);
+        }
+
+        *cursor = (*cursor).saturating_add(1);
+    }
+
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects, reason = "test arithmetic on known small values")]
 mod tests {
@@ -720,5 +758,30 @@ mod tests {
             None,
             "pos far before alignment must return None"
         );
+    }
+
+    #[test]
+    fn cursor_lookup_matches_random_access_for_monotonic_complex_cigar() {
+        let cigar = [
+            op(CigarOpType::SoftClip, 5),
+            op(CigarOpType::Match, 10),
+            op(CigarOpType::Insertion, 2),
+            op(CigarOpType::Deletion, 3),
+            op(CigarOpType::Match, 5),
+            op(CigarOpType::RefSkip, 4),
+            op(CigarOpType::Match, 6),
+        ];
+        let mapping = CigarMapping::new(Pos0::new(100).unwrap(), &cigar).unwrap();
+        assert!(matches!(mapping, CigarMapping::Complex(_)));
+
+        let mut cursor = 0usize;
+        for pos in 95..140 {
+            let pos = Pos0::new(pos).unwrap();
+            assert_eq!(
+                mapping.pos_info_at_cursor(pos, &mut cursor),
+                mapping.pos_info_at(pos),
+                "cursor lookup diverged at {pos:?}"
+            );
+        }
     }
 }
