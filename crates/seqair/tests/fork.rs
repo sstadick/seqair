@@ -45,6 +45,40 @@ fn fetch_record_positions(
         .collect()
 }
 
+fn fetch_raw_record_positions(
+    reader: &mut IndexedBamReader,
+    contig: &str,
+    start: u64,
+    end: u64,
+) -> Vec<(i64, i64)> {
+    let tid = reader.header().tid(contig).expect("tid lookup");
+    let mut positions = Vec::new();
+    reader
+        .fetch_raw_records(
+            tid,
+            Pos0::new(start as u32).unwrap(),
+            Pos0::new(end as u32).unwrap(),
+            &mut |fields| {
+                positions.push((fields.pos.as_i64(), fields.end_pos.as_i64()));
+                true
+            },
+        )
+        .expect("fetch_raw_records");
+    positions
+}
+
+#[test]
+fn raw_record_fetch_matches_store_fetch_positions() {
+    let mut store_reader = IndexedBamReader::open(test_bam_path()).expect("open store reader");
+    let mut raw_reader = IndexedBamReader::open(test_bam_path()).expect("open raw reader");
+
+    for &(contig, start, end) in CONTIGS {
+        let store_records = fetch_record_positions(&mut store_reader, contig, start, end);
+        let raw_records = fetch_raw_record_positions(&mut raw_reader, contig, start, end);
+        assert_eq!(raw_records, store_records, "{contig}: raw visitor and store fetch differ");
+    }
+}
+
 // r[verify bam.reader.fork]
 // r[verify bam.reader.fork_equivalence]
 #[test]

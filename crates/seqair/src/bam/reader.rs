@@ -10,8 +10,8 @@ use super::{
     flags::BamFlags,
     header::{BamHeader, BamHeaderError},
     index::{AlignmentIndex, BaiError, BamIndex, Chunk},
-    record::{DecodeError, compute_end_pos_from_raw},
-    record_store::{CustomizeRecordStore, RecordStore},
+    record::{self, DecodeError, compute_end_pos_from_raw},
+    record_store::{CustomizeRecordStore, FilterRawFields, RecordStore},
     region_buf::{self, RegionBuf},
 };
 use seqair_types::{Pos0, SmolStr};
@@ -172,6 +172,95 @@ impl IndexedBamReader<std::io::Cursor<Vec<u8>>> {
     }
 }
 
+fn compute_end_pos_from_parsed_header(h: &record::ParsedHeader, raw: &[u8]) -> Option<Pos0> {
+    use super::cigar::{CIGAR_D, CIGAR_EQ, CIGAR_M, CIGAR_N, CIGAR_X};
+    use seqair_types::Offset;
+
+    debug_assert!(h.cigar_end <= raw.len(), "cigar overrun: {} > {}", h.cigar_end, raw.len());
+    #[allow(clippy::indexing_slicing, reason = "cigar_end ≤ raw.len() checked by parse_header")]
+    let cigar_bytes = &raw[h.var_start..h.cigar_end];
+
+    let mut ref_len: i64 = 0;
+    for chunk in cigar_bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact(4) yields 4 bytes");
+        let op = u32::from_le_bytes(arr);
+        let op_len = i64::from(op >> 4);
+        let op_type = (op & 0xF) as u8;
+        match op_type {
+            CIGAR_M | CIGAR_D | CIGAR_N | CIGAR_EQ | CIGAR_X => {
+                ref_len = ref_len.checked_add(op_len)?;
+            }
+            _ => {}
+        }
+    }
+    if ref_len == 0 {
+        Some(h.pos)
+    } else {
+        h.pos.checked_add_offset(Offset::new(ref_len.checked_sub(1)?))
+    }
+}
+
+fn raw_filter_fields<'a>(
+    raw: &'a [u8],
+    h: &record::ParsedHeader,
+    end_pos: Pos0,
+) -> FilterRawFields<'a> {
+    debug_assert!(h.qual_end <= raw.len(), "qual_end overrun: {} > {}", h.qual_end, raw.len());
+    #[allow(clippy::indexing_slicing, reason = "all bounds ≤ qual_end ≤ raw.len()")]
+    let qname_raw = &raw[32..h.var_start];
+    let qname_actual_len = qname_raw.iter().position(|&b| b == 0).unwrap_or(qname_raw.len());
+
+    #[allow(clippy::indexing_slicing, reason = "qname_actual_len <= qname_raw.len()")]
+    let qname_stripped = &qname_raw[..qname_actual_len];
+    #[allow(clippy::indexing_slicing, reason = "all bounds ≤ qual_end ≤ raw.len()")]
+    let cigar_bytes = &raw[h.var_start..h.cigar_end];
+    #[allow(clippy::indexing_slicing, reason = "all bounds ≤ qual_end ≤ raw.len()")]
+    let packed_seq = &raw[h.cigar_end..h.seq_end];
+    #[allow(clippy::indexing_slicing, reason = "all bounds ≤ qual_end ≤ raw.len()")]
+    let qual = &raw[h.seq_end..h.qual_end];
+    #[allow(clippy::indexing_slicing, reason = "qual_end ≤ raw.len()")]
+    let aux = &raw[h.qual_end..];
+
+    let mut matching_bases = 0u32;
+    let mut indel_bases = 0u32;
+    for chunk in cigar_bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact(4) yields 4 bytes");
+        let packed = u32::from_le_bytes(arr);
+        let len = packed >> 4;
+        match (packed & 0xF) as u8 {
+            super::cigar::CIGAR_M | super::cigar::CIGAR_EQ | super::cigar::CIGAR_X => {
+                matching_bases = matching_bases.saturating_add(len);
+            }
+            super::cigar::CIGAR_I | super::cigar::CIGAR_D => {
+                indel_bases = indel_bases.saturating_add(len);
+            }
+            _ => {}
+        }
+    }
+
+    FilterRawFields {
+        pos: h.pos,
+        end_pos,
+        flags: h.flags,
+        mapq: h.mapq,
+        n_cigar_ops: h.n_cigar_ops,
+        seq_len: h.seq_len,
+        matching_bases,
+        indel_bases,
+        tid: h.tid,
+        next_ref_id: h.next_ref_id,
+        next_pos: h.next_pos,
+        template_len: h.template_len,
+        qname: qname_stripped,
+        qual_bytes: qual,
+        aux_bytes: aux,
+        raw_cigar_bytes: Some(cigar_bytes),
+        cigar_ops: None,
+        packed_seq: Some(packed_seq),
+        bases: None,
+    }
+}
+
 impl<R: Read + Seek> IndexedBamReader<R> {
     // r[impl bam.reader.fork_arc_identity]
     pub fn shared(&self) -> &Arc<BamShared> {
@@ -216,6 +305,85 @@ impl<R: Read + Seek> IndexedBamReader<R> {
         store: &mut RecordStore,
     ) -> Result<usize, BamError> {
         self.fetch_into_customized(tid, start, end, store, &mut ()).map(|c| c.kept)
+    }
+
+    /// Visit raw BAM records for a region without pushing them into a [`RecordStore`].
+    ///
+    /// The visitor runs after the reader's built-in tid/unmapped/overlap checks
+    /// and receives [`FilterRawFields`] with header fields plus borrowed raw
+    /// qname/CIGAR/SEQ/QUAL/AUX slices. Returning `true` counts the record as
+    /// kept; returning `false` skips it in the returned [`FetchCounts`]. No
+    /// sequence decoding or slab copies are performed.
+    ///
+    /// This is intended for projection-style consumers that only need record
+    /// intervals, CIGAR bytes, qnames, or other raw fields and do not need a
+    /// pileup-ready [`RecordStore`].
+    pub fn fetch_raw_records<V>(
+        &mut self,
+        tid: u32,
+        start: Pos0,
+        end: Pos0,
+        visitor: &mut V,
+    ) -> Result<FetchCounts, BamError>
+    where
+        V: FnMut(&FilterRawFields<'_>) -> bool,
+    {
+        let chunks = self.shared.index.query(tid, start, end);
+        if chunks.is_empty() {
+            return Ok(FetchCounts::default());
+        }
+
+        let tid_i32 = validate_tid(tid)?;
+        let mut accepted: u32 = 0;
+        let mut kept_count: usize = 0;
+        let mut scratch: Vec<u8> = Vec::new();
+        let batches = partition_chunks(&chunks, region_buf::MAX_REGION_BYTES);
+
+        for batch in &batches {
+            let mut region = RegionBuf::load(&mut self.bulk_reader, batch)?;
+
+            for chunk in batch {
+                region.seek_virtual(chunk.begin)?;
+
+                loop {
+                    let current_voff = region.virtual_offset();
+                    if current_voff >= chunk.end {
+                        break;
+                    }
+
+                    let raw = match region.read_record(&mut scratch) {
+                        Ok(s) => s,
+                        Err(BgzfError::UnexpectedEof) => break,
+                        Err(e) => return Err(BamError::from(e)),
+                    };
+
+                    if raw.len() < 32 {
+                        return Err(BamError::TruncatedRecord { offset: current_voff.0 });
+                    }
+
+                    let h = record::parse_header(raw)?;
+                    if h.tid != tid_i32 {
+                        continue;
+                    }
+                    if h.flags.is_unmapped() && !self.keep_unmapped {
+                        continue;
+                    }
+
+                    let rec_end = compute_end_pos_from_parsed_header(&h, raw).unwrap_or(h.pos);
+                    if h.pos > end || rec_end < start {
+                        continue;
+                    }
+
+                    accepted = accepted.saturating_add(1);
+                    let fields = raw_filter_fields(raw, &h, rec_end);
+                    if visitor(&fields) {
+                        kept_count = kept_count.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        Ok(FetchCounts { fetched: accepted as usize, kept: kept_count })
     }
 
     // r[impl unified.fetch_into_customized]
