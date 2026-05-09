@@ -284,15 +284,18 @@ impl PileupSummary {
 /// on the same engine. Access per-record extras or slab data (qname, aux) via
 /// [`alignments`](Self::alignments), which yields [`AlignmentView`] wrappers, or
 /// via [`store`](Self::store) directly.
-pub struct PileupColumn<'store, U = ()> {
+pub struct PileupColumn<'store, U = (), A = Vec<PileupAlignment>> {
     pos: Pos0,
     reference_base: Base,
-    alignments: Vec<PileupAlignment>,
+    alignments: A,
     summary: PileupSummary,
     store: &'store RecordStore<U>,
 }
 
-impl<U> std::fmt::Debug for PileupColumn<'_, U> {
+impl<U, A> std::fmt::Debug for PileupColumn<'_, U, A>
+where
+    A: AsRef<[PileupAlignment]>,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PileupColumn")
             .field("pos", &self.pos)
@@ -302,7 +305,10 @@ impl<U> std::fmt::Debug for PileupColumn<'_, U> {
     }
 }
 
-impl<'store, U> PileupColumn<'store, U> {
+impl<'store, U, A> PileupColumn<'store, U, A>
+where
+    A: AsRef<[PileupAlignment]>,
+{
     #[must_use]
     pub fn pos(&self) -> Pos0 {
         self.pos
@@ -321,12 +327,12 @@ impl<'store, U> PileupColumn<'store, U> {
     /// [`qname`](AlignmentView::qname), and [`aux`](AlignmentView::aux) for slab data.
     pub fn alignments(&self) -> impl Iterator<Item = AlignmentView<'_, 'store, U>> + '_ {
         let store = self.store;
-        self.alignments.iter().map(move |aln| AlignmentView { aln, store })
+        self.alignments.as_ref().iter().map(move |aln| AlignmentView { aln, store })
     }
 
     /// Iterate the raw alignments without store access (equivalent to the old API).
     pub fn raw_alignments(&self) -> impl Iterator<Item = &PileupAlignment> + '_ {
-        self.alignments.iter()
+        self.alignments.as_ref().iter()
     }
 
     pub fn reference_base(&self) -> Base {
@@ -684,6 +690,59 @@ impl<U> PileupColumnAccumulator<U> for MaterializeColumnAccumulator {
             pos,
             reference_base: self.reference_base,
             alignments: std::mem::take(&mut self.alignments),
+            summary: self.summary,
+        })
+    }
+}
+
+struct BufferedMaterializedColumn {
+    pos: Pos0,
+    reference_base: Base,
+    summary: PileupSummary,
+}
+
+struct BufferedMaterializeColumnAccumulator<'a> {
+    pos: Option<Pos0>,
+    reference_base: Base,
+    alignments: &'a mut Vec<PileupAlignment>,
+    summary: PileupSummary,
+}
+
+impl<'a> BufferedMaterializeColumnAccumulator<'a> {
+    fn new(alignments: &'a mut Vec<PileupAlignment>) -> Self {
+        Self {
+            pos: None,
+            reference_base: Base::Unknown,
+            alignments,
+            summary: PileupSummary::default(),
+        }
+    }
+}
+
+impl<U> PileupColumnAccumulator<U> for BufferedMaterializeColumnAccumulator<'_> {
+    type Output = BufferedMaterializedColumn;
+
+    fn begin_column(&mut self, pos: Pos0, reference_base: Base) {
+        self.pos = Some(pos);
+        self.reference_base = reference_base;
+        self.alignments.clear();
+        self.summary = PileupSummary::default();
+    }
+
+    fn reserve_column(&mut self, active_upper_bound: usize) {
+        self.alignments.reserve(active_upper_bound);
+    }
+
+    fn observe_alignment(&mut self, alignment: PileupAlignment, _store: &RecordStore<U>) {
+        self.summary.observe(&alignment);
+        self.alignments.push(alignment);
+    }
+
+    fn finish_column(&mut self, _context: PileupColumnContext<'_, U>) -> Option<Self::Output> {
+        let pos = self.pos.take()?;
+        Some(BufferedMaterializedColumn {
+            pos,
+            reference_base: self.reference_base,
             summary: self.summary,
         })
     }
@@ -1091,6 +1150,33 @@ impl<U> PileupEngine<U> {
                 AccumulatorAdvance::Output(output) => return Some(output),
             }
         }
+    }
+
+    /// Advance to the next pileup column, storing alignments in a caller-provided buffer.
+    ///
+    /// This is equivalent to [`Self::pileups`] except the per-column alignment
+    /// storage is borrowed from `alignments`. The buffer is cleared before each
+    /// emitted column and retains its allocation across calls, which lets callers
+    /// avoid one `Vec` allocation per pileup column in materialized-column paths.
+    ///
+    /// The returned column borrows both the engine's record store and the caller's
+    /// alignment buffer, so it must be dropped before calling `pileups_into` again
+    /// with the same buffer.
+    pub fn pileups_into<'buf>(
+        &mut self,
+        alignments: &'buf mut Vec<PileupAlignment>,
+    ) -> Option<PileupColumn<'_, U, &'buf [PileupAlignment]>> {
+        let materialized = {
+            let mut accumulator = BufferedMaterializeColumnAccumulator::new(alignments);
+            self.pileup_with(&mut accumulator)?
+        };
+        Some(PileupColumn {
+            pos: materialized.pos,
+            reference_base: materialized.reference_base,
+            alignments: alignments.as_slice(),
+            summary: materialized.summary,
+            store: &self.store,
+        })
     }
 
     // r[impl pileup.lending_iterator]

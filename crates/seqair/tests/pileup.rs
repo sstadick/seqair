@@ -281,6 +281,33 @@ fn pileup_summary_counts_emitted_alignments() {
     assert_eq!(column.raw_alignments().count(), expected.depth);
 }
 
+#[test]
+fn pileups_into_reuses_caller_alignment_buffer() {
+    let mut arena = RecordStore::new();
+    arena.push_raw(&make_record(0, 0, 99, 60, 3), &mut ()).unwrap();
+    arena.push_raw(&make_record(0, 1, 99, 60, 2), &mut ()).unwrap();
+
+    let mut engine = PileupEngine::new(arena, Pos0::new(0).unwrap(), Pos0::new(2).unwrap());
+    let mut alignments = Vec::with_capacity(1);
+
+    {
+        let column = engine.pileups_into(&mut alignments).unwrap();
+        assert_eq!(column.pos(), Pos0::new(0).unwrap());
+        assert_eq!(column.depth(), 1);
+        assert_eq!(column.raw_alignments().count(), 1);
+    }
+    let capacity_after_first = alignments.capacity();
+
+    {
+        let column = engine.pileups_into(&mut alignments).unwrap();
+        assert_eq!(column.pos(), Pos0::new(1).unwrap());
+        assert_eq!(column.depth(), 2);
+        assert_eq!(column.raw_alignments().count(), 2);
+    }
+
+    assert!(alignments.capacity() >= capacity_after_first);
+}
+
 // r[verify pileup.summary_matches_alignments]
 // r[verify pileup.custom_aggregation_max_depth]
 #[test]
