@@ -12,7 +12,7 @@
     reason = "test code with known small values"
 )]
 use seqair::bam::Pos0;
-use seqair::bam::record_store::RecordStore;
+use seqair::bam::record_store::{DecodeProfile, RecordStore};
 use seqair_types::{BamFlags, Base, BaseQuality};
 
 // r[verify record_store.push_raw+2]
@@ -40,6 +40,33 @@ fn decode_record_into_slabs() {
     assert_eq!(store.seq_at(idx, 3), Base::T);
     assert_eq!(store.qual(idx).len(), 4);
     assert!(store.qual(idx).iter().all(|q| q.get() == Some(30)));
+}
+
+#[test]
+fn decode_profile_can_skip_qname_and_aux_slabs() {
+    let raw = make_test_record(
+        0,
+        100,
+        0x63,
+        60,
+        b"read1",
+        &[(4 << 4)],
+        &[0x12, 0x48],
+        &[30; 4],
+        b"NM\x01\x02",
+    );
+
+    let mut store = RecordStore::new();
+    let idx = store
+        .push_raw_with_profile(&raw, &mut (), DecodeProfile::PILEUP_NO_NAMES_OR_AUX)
+        .expect("decode")
+        .expect("kept");
+
+    assert_eq!(store.qname(idx), b"");
+    assert_eq!(store.aux(idx), b"");
+    assert_eq!(store.seq_at(idx, 0), Base::A);
+    assert_eq!(store.qual(idx)[0].get(), Some(30));
+    assert_eq!(store.cigar(idx).len(), 1);
 }
 
 // r[verify record_store.push_raw+2]

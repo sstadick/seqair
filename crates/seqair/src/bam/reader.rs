@@ -11,7 +11,7 @@ use super::{
     header::{BamHeader, BamHeaderError},
     index::{AlignmentIndex, BaiError, BamIndex, Chunk},
     record::{DecodeError, compute_end_pos_from_raw},
-    record_store::{CustomizeRecordStore, RecordStore},
+    record_store::{CustomizeRecordStore, DecodeProfile, RecordStore},
     region_buf::{self, RegionBuf},
 };
 use seqair_types::{Pos0, SmolStr};
@@ -233,6 +233,30 @@ impl<R: Read + Seek> IndexedBamReader<R> {
         store: &mut RecordStore<E::Extra>,
         customize: &mut E,
     ) -> Result<FetchCounts, BamError> {
+        self.fetch_into_customized_with_profile(
+            tid,
+            start,
+            end,
+            store,
+            customize,
+            DecodeProfile::FULL,
+        )
+    }
+
+    /// Customized fetch with a caller-selected cold-slab decode profile.
+    ///
+    /// Use this when downstream code does not need qnames and/or aux tags from
+    /// the returned [`RecordStore`]. CIGAR, bases, and qualities are still
+    /// decoded so the store remains pileup-ready.
+    pub fn fetch_into_customized_with_profile<E: CustomizeRecordStore>(
+        &mut self,
+        tid: u32,
+        start: Pos0,
+        end: Pos0,
+        store: &mut RecordStore<E::Extra>,
+        customize: &mut E,
+        profile: DecodeProfile,
+    ) -> Result<FetchCounts, BamError> {
         store.clear();
 
         let chunks = self.shared.index.query(tid, start, end);
@@ -310,7 +334,7 @@ impl<R: Read + Seek> IndexedBamReader<R> {
                     }
 
                     accepted = accepted.saturating_add(1);
-                    if store.push_raw(raw, customize)?.is_some() {
+                    if store.push_raw_with_profile(raw, customize, profile)?.is_some() {
                         kept_count = kept_count.saturating_add(1);
                     }
                 }

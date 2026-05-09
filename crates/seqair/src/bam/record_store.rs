@@ -206,6 +206,36 @@ pub enum Slab {
     Extras,
 }
 
+/// Select which cold BAM slabs are retained while decoding raw records.
+///
+/// Bases, qualities, and CIGAR are always decoded because the current
+/// [`RecordStore`] layout assumes pileup-ready records. This profile only
+/// controls cold slabs that are not needed by many pileup consumers: qnames
+/// and auxiliary tags. Skipping them makes the corresponding getters return
+/// empty slices for records decoded with that profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeProfile {
+    /// Store query names in the qname slab.
+    pub names: bool,
+    /// Store auxiliary tag bytes in the aux slab.
+    pub aux: bool,
+}
+
+impl DecodeProfile {
+    /// Decode all slabs. This is the default and preserves existing behavior.
+    pub const FULL: Self = Self { names: true, aux: true };
+    /// Decode pileup-required slabs plus qnames, but skip aux tags.
+    pub const PILEUP_NO_AUX: Self = Self { names: true, aux: false };
+    /// Decode only pileup-required slabs, skipping qnames and aux tags.
+    pub const PILEUP_NO_NAMES_OR_AUX: Self = Self { names: false, aux: false };
+}
+
+impl Default for DecodeProfile {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
 // r[impl record_store.push_raw+2]
 // r[impl record_store.field_access]
 // r[impl record_store.clear+2]
@@ -327,6 +357,21 @@ impl<U> RecordStore<U> {
         raw: &[u8],
         customize: &mut E,
     ) -> Result<Option<u32>, DecodeError> {
+        self.push_raw_with_profile(raw, customize, DecodeProfile::FULL)
+    }
+
+    /// Decode a raw BAM record with a caller-selected cold-slab profile.
+    ///
+    /// This is equivalent to [`Self::push_raw`] when `profile` is
+    /// [`DecodeProfile::FULL`]. Profiles that skip qnames or aux tags still run
+    /// `filter_raw` against the borrowed raw bytes before skipping any slab copy,
+    /// but post-push `filter`/`compute` will see empty qname/aux slices.
+    pub fn push_raw_with_profile<E: CustomizeRecordStore<Extra = U>>(
+        &mut self,
+        raw: &[u8],
+        customize: &mut E,
+        profile: DecodeProfile,
+    ) -> Result<Option<u32>, DecodeError> {
         let h = record::parse_header(raw)?;
 
         let idx = u32::try_from(self.records.len()).map_err(|_| DecodeError::SlabOverflow)?;
@@ -397,8 +442,13 @@ impl<U> RecordStore<U> {
         // --- Write into name slab ---
         // r[impl record_store.checked_offsets]
         let name_off = u32::try_from(self.names.len()).map_err(|_| DecodeError::SlabOverflow)?;
-        #[allow(clippy::indexing_slicing, reason = "qname_actual_len ≤ qname_raw.len()")]
-        self.names.extend_from_slice(&qname_raw[..qname_actual_len]);
+        let stored_name_len = if profile.names {
+            #[allow(clippy::indexing_slicing, reason = "qname_actual_len ≤ qname_raw.len()")]
+            self.names.extend_from_slice(&qname_raw[..qname_actual_len]);
+            qname_actual_len
+        } else {
+            0
+        };
 
         // --- Write into bases slab (4-bit → Base via SIMD, direct-to-slab) ---
         // r[impl record_store.checked_offsets]
@@ -438,7 +488,12 @@ impl<U> RecordStore<U> {
         // Aux data (everything after qual)
         #[allow(clippy::indexing_slicing, reason = "qual_end ≤ raw.len()")]
         let aux_slice = &raw[h.qual_end..];
-        self.aux.extend_from_slice(aux_slice);
+        let stored_aux_len = if profile.aux {
+            self.aux.extend_from_slice(aux_slice);
+            aux_slice.len()
+        } else {
+            0
+        };
 
         self.records.push(SlimRecord {
             pos: h.pos,
@@ -458,7 +513,7 @@ impl<U> RecordStore<U> {
                 clippy::cast_possible_truncation,
                 reason = "BAM qname is validated to ≤ 254 bytes by parse_header (l_read_name is u8); fits in u16"
             )]
-            name_len: qname_actual_len as u16,
+            name_len: stored_name_len as u16,
             bases_off,
             cigar_off,
             qual_off,
@@ -467,7 +522,7 @@ impl<U> RecordStore<U> {
                 clippy::cast_possible_truncation,
                 reason = "aux data is bounded by slab limits (u32); slab overflow checked above via SlabOverflow"
             )]
-            aux_len: aux_slice.len() as u32,
+            aux_len: stored_aux_len as u32,
             extras_idx: idx,
         });
         self.extras.push(customize.compute(
