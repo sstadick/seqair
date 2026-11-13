@@ -18,6 +18,91 @@ use seqair_types::MappingQuality;
 use seqair_types::QPos;
 use seqair_types::{BamFlags, BaseQuality, IupacBase};
 
+// r[verify record_store.retain_auxiliary]
+#[test]
+fn auxiliary_retention_is_optional_for_both_push_paths() {
+    use seqair::bam::record_store::{CustomizeRecordStore, FilterRawFields, SlimRecord};
+
+    const TAGS: &[u8] = b"NMCHRGZsample\0";
+
+    #[derive(Clone)]
+    struct NoAux {
+        keep: bool,
+    }
+
+    impl CustomizeRecordStore for NoAux {
+        type Extra = ();
+        const RETAIN_AUXILIARY: bool = false;
+
+        fn filter_raw(&mut self, fields: &FilterRawFields<'_>) -> bool {
+            assert_eq!(fields.aux_bytes, TAGS);
+            true
+        }
+
+        fn compute(&mut self, rec: &SlimRecord, store: &RecordStore) {
+            assert!(rec.aux(store).unwrap().as_bytes().is_empty());
+        }
+
+        fn filter(&mut self, rec: &SlimRecord, store: &RecordStore) -> bool {
+            assert!(rec.aux(store).unwrap().as_bytes().is_empty());
+            self.keep
+        }
+    }
+
+    let raw =
+        make_test_record(0, 100, 0x63, 60, b"read1", &[4 << 4], &[0x12, 0x48], &[30; 4], TAGS);
+    for parsed in [false, true] {
+        let mut store = RecordStore::new();
+        // Reuse populated allocations, and mix retaining/non-retaining pushes.
+        for _ in 0..2 {
+            let original = store.push_raw(&raw, helpers::header(), &mut ()).unwrap().unwrap();
+            assert_eq!(store.record(original).unwrap().aux(), TAGS);
+            for keep in [false, true] {
+                let mut customize = NoAux { keep };
+                let result = if parsed {
+                    let rec = store.record(original).unwrap();
+                    let cigar = rec.cigar().to_vec();
+                    let bases = rec.seq().to_vec();
+                    store.push_fields(
+                        Pos0::new(100).unwrap(),
+                        Pos0::new(103).unwrap(),
+                        BamFlags::from(0x63),
+                        MappingQuality::from_byte(60),
+                        4,
+                        0,
+                        b"read1",
+                        &cigar,
+                        &bases,
+                        &[30; 4],
+                        TAGS,
+                        Some(helpers::tid(0)),
+                        seqair::bam::MateFields::default(),
+                        &mut customize,
+                    )
+                } else {
+                    store.push_raw(&raw, helpers::header(), &mut customize)
+                }
+                .unwrap();
+                assert_eq!(result.is_some(), keep);
+                if let Some(index) = result {
+                    let lean = store.record(index).unwrap();
+                    let full = store.record(original).unwrap();
+                    assert!(lean.aux().is_empty());
+                    assert_eq!(lean.qname(), full.qname());
+                    assert_eq!(lean.cigar(), full.cigar());
+                    assert_eq!(lean.seq(), full.seq());
+                    assert_eq!(lean.qual(), full.qual());
+                    assert_eq!(lean.pos, full.pos);
+                    assert_eq!(lean.end_pos, full.end_pos);
+                }
+                assert_eq!(store.record(original).unwrap().aux(), TAGS);
+            }
+            assert_eq!(store.len(), 2);
+            store.clear();
+        }
+    }
+}
+
 // r[verify record_store.push_raw+3]
 // r[verify record_store.field_access]
 #[test]

@@ -242,6 +242,15 @@ across regions, which is the whole reason the trait is the only door.
 r[record_store.filter_raw]
 `CustomizeRecordStore::filter_raw(&mut self, fields: &FilterRawFields<'_>) -> bool` MUST run in both `push_raw` and `push_fields` before any slab is extended and before any sequence is decoded. Returning `false` MUST abandon the record there and then: no bytes copied into any slab, no bases decoded, no `compute` call, and no index minted — `push_raw`/`push_fields` return `Ok(None)` exactly as for a `filter` rejection. The default MUST return `true`. `filter_raw` and `filter` (r[`record_store.pre_filter.rollback`]) MUST be interchangeable in outcome: the same decision taken at either hook MUST leave every slab byte-identical and MUST hand back the same indices. They differ only in how much work a rejection wastes, which is why `filter_raw` is the hook a reader-level filter belongs in (r[`bam.reader.unmapped_skipped`]).
 
+r[record_store.retain_auxiliary]
+`CustomizeRecordStore::RETAIN_AUXILIARY` MUST default to `true`. Setting it to
+`false` MUST omit auxiliary tag bytes from records appended by `push_raw` and
+`push_fields`, without changing any other stored field. `filter_raw` MUST still
+receive the original auxiliary bytes; `compute`, `filter`, and subsequent
+record access MUST see an empty auxiliary slice for those records. This option
+does not change input decoding. Clearing and reusing a store, or mixing pushes
+with different customizers, MUST NOT expose tags from a previous record.
+
 r[record_store.filter_raw_fields+1]
 `FilterRawFields` MUST carry every fixed field of the record that is about to be pushed, plus the raw qname, quality, aux and CIGAR slices, so a customize value can decide without the slabs. It MUST be `#[non_exhaustive]`, and the qname MUST be NUL-stripped. Fields the calling path has not computed yet MUST be reported as unknown rather than guessed: from `push_raw` (BAM binary), `end_pos` is `None` and `matching_bases`/`indel_bases` are `0` because the CIGAR has not been decoded at that point; from `push_fields` (SAM/CRAM) all three carry their pre-computed values. `seq` MUST be `Sequence::Packed` from `push_raw` and `Sequence::Iupac` from `push_fields`; `cigar` MUST be raw BAM CIGAR bytes on both paths. Every field MUST describe the record that the next successful push appends — a filter deciding on a stale or mis-sliced view rejects the wrong reads, and nothing downstream notices, because every record that survives is well-formed either way.
 
@@ -277,8 +286,9 @@ consumer that deduplicates overlapping mates keeps both.
 Both MUST therefore be unrepresentable rather than documented.
 `PileupEngine::new` and `PileupEngine::with_scratch` MUST take a `PileupInput`,
 not a `RecordStore`. `PileupInput` MUST have no public constructor;
-`RecordStore::prepare_for_pileup(self) -> Prepared` MUST be the only way to
-obtain one. `Prepared` MUST carry the `PileupInput` and the `MateLinkStats`
+`RecordStore::prepare_for_pileup(self) -> Prepared` MUST be the default way to
+obtain one. The explicit opt-out below is the only exception to mate linking.
+`Prepared` MUST carry the `PileupInput` and the `MateLinkStats`
 linking produced, since callers log the latter and the engine has no use for it.
 
 `prepare_for_pileup` MUST sort by position before linking — a mate index is a
@@ -286,6 +296,15 @@ store index and cannot survive a reorder — and MUST be idempotent: the sort is
 skipped when no push arrived out of order and the linking when nothing has
 invalidated it. The resulting pileup MUST NOT depend on the order records were
 pushed in.
+
+r[record_store.pileup_input.without_mates]
+`prepare_for_pileup_without_mate_links` MUST produce a position-sorted,
+window-indexed `PileupInput` without matching read names. All mate links,
+including links established before the call, MUST be cleared. Pileup positions
+and alignments MUST match the default preparation, but `mate_idx()` MUST be
+`None` and `in_mate_overlap()` MUST be `false`. This method is for callers that
+perform their own mate resolution or deliberately count both mates. The default
+`prepare_for_pileup` MUST continue linking mates.
 
 r[record_store.pileup_input.order_tracking]
 The store MUST track whether its records are in ascending `pos` order. A push
