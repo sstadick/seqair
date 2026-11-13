@@ -394,9 +394,10 @@ pub struct RecordStore<U = ()> {
 /// A [`RecordStore`] in ascending position order, with mates linked unless
 /// the caller explicitly opted out to perform its own mate resolution.
 ///
-/// Obtain one through [`RecordStore::prepare_for_pileup`] or
-/// [`RecordStore::prepare_for_pileup_without_mate_links`]. Both establish the
-/// ordering and window index required by the engine.
+/// Obtain one through [`RecordStore::prepare_for_pileup`],
+/// [`RecordStore::prepare_for_pileup_without_mate_links`], or
+/// [`RecordStore::prepare_for_sequential_pileup`]. All establish position order;
+/// the sequential form skips the optional window-query index.
 ///
 /// [`PileupEngine`]: crate::bam::pileup::PileupEngine
 pub struct PileupInput<U = ()> {
@@ -1785,13 +1786,27 @@ impl<U> RecordStore<U> {
     /// Records are still sorted by position and indexed for window queries.
     /// For automatic mate links, use [`prepare_for_pileup`](Self::prepare_for_pileup).
     #[must_use]
-    pub fn prepare_for_pileup_without_mate_links(mut self) -> PileupInput<U> {
+    pub fn prepare_for_pileup_without_mate_links(self) -> PileupInput<U> {
+        let mut input = self.prepare_for_sequential_pileup();
+        input.store.build_reach();
+        input
+    }
+
+    // r[impl record_store.pileup_input.sequential]
+    /// Prepare for a sequential column walk with no automatic mate resolution.
+    ///
+    /// Sorts records and clears mate links, but skips the index used to find
+    /// reads overlapping arbitrary windows. Window queries remain correct but
+    /// scan records from the beginning. Use an indexed preparation method if
+    /// making many such queries.
+    #[must_use]
+    pub fn prepare_for_sequential_pileup(mut self) -> PileupInput<U> {
         if self.order == RecordOrder::Unknown {
             self.sort_by_pos();
         } else {
             self.clear_mate_links();
         }
-        self.build_reach();
+        self.reach.clear();
         PileupInput { store: self }
     }
 
@@ -1832,6 +1847,10 @@ impl<U> RecordStore<U> {
     /// whether or not any record is mapped. A lower bound either way, and the
     /// forward scan drops the unmapped records it hands back.
     pub(crate) fn first_reaching(&self, start: Pos0) -> usize {
+        // r[impl record_store.pileup_input.sequential]
+        if self.reach.is_empty() {
+            return 0;
+        }
         debug_assert_eq!(
             self.reach.len(),
             self.records.len(),
@@ -3002,6 +3021,7 @@ pub(crate) mod tests {
         /// fact, and spans that are empty, before, past, inside, or a base
         /// off a record's edge.
         #[hegel::test]
+        // r[verify record_store.pileup_input.sequential]
         fn matches_brute_force(tc: TestCase) {
             let reads = tc.draw(arb_store());
             let moves = tc.draw(arb_moves());
@@ -3011,18 +3031,23 @@ pub(crate) mod tests {
                 read.push(&mut store, i);
             }
             apply_moves(&mut store, &reads, &moves);
-            let input = store.prepare_for_pileup().input;
-            for span in spans {
-                let (start, end) = span.resolve(input.store());
-                let fast: Vec<RecordIdx> = input.records_overlapping(start, end).collect();
-                assert_eq!(
-                    fast,
-                    brute_force(input.store(), start, end),
-                    "span {:?} = {:?}..={:?}",
-                    span,
-                    start,
-                    end
-                );
+            let mut input = store.prepare_for_pileup().input;
+            for sequential in [false, true] {
+                if sequential {
+                    input = input.into_store().prepare_for_sequential_pileup();
+                }
+                for span in &spans {
+                    let (start, end) = span.resolve(input.store());
+                    let fast: Vec<RecordIdx> = input.records_overlapping(start, end).collect();
+                    assert_eq!(
+                        fast,
+                        brute_force(input.store(), start, end),
+                        "span {:?} = {:?}..={:?}",
+                        span,
+                        start,
+                        end
+                    );
+                }
             }
         }
 

@@ -25,6 +25,73 @@ use seqair_types::{Base, QPos};
 use std::num::NonZeroU32;
 use std::{cell::Cell, rc::Rc};
 
+// r[verify pileup.lazy_reference_check]
+#[test]
+fn lazy_reference_check_preserves_alignments_and_answers() {
+    use seqair::bam::pileup::{Indel, PileupOp};
+
+    for reference in [Base::A, Base::C, Base::Unknown] {
+        for cap in [None, NonZeroU32::new(1)] {
+            let make_engine = || {
+                let mut store = RecordStore::new();
+                let complex = make_record_with_cigar(
+                    0,
+                    2,
+                    0,
+                    60,
+                    &[
+                        cigar_op(2, 0),
+                        cigar_op(1, 1),
+                        cigar_op(1, 0),
+                        cigar_op(2, 2),
+                        cigar_op(1, 0),
+                        cigar_op(2, 3),
+                        cigar_op(1, 0),
+                    ],
+                    6,
+                );
+                store.push_raw(&complex, helpers::header(), &mut ()).unwrap();
+                store.push_raw(&make_record(0, 3, 0, 20, 8), helpers::header(), &mut ()).unwrap();
+                let mut engine = PileupEngine::new(
+                    store.prepare_for_pileup().input,
+                    (Pos0::ZERO..=Pos0::new(15).unwrap()).into(),
+                );
+                engine.set_reference_seq(RefSeq::new(vec![reference; 16].into(), Pos0::ZERO));
+                if let Some(cap) = cap {
+                    engine.set_max_depth(cap);
+                }
+                engine
+            };
+            let mut eager = make_engine();
+            let mut lazy = make_engine();
+            while let Some(expected) = eager.pileups() {
+                let actual = lazy.pileups_lazy_reference().unwrap();
+                assert_eq!(actual.pos(), expected.pos());
+                assert_eq!(actual.depth(), expected.depth());
+                let want_match = expected.raw_alignments().all(|a| {
+                    matches!(a.op, PileupOp::Match { base, .. } if base == reference)
+                        && a.indel_after() == Indel::None
+                });
+                assert_eq!(actual.matches_reference(), want_match);
+                assert_eq!(actual.matches_reference(), expected.matches_reference());
+                for (a, b) in actual.raw_alignments().zip(expected.raw_alignments()) {
+                    assert_eq!(a.op, b.op);
+                    assert_eq!(a.indel_after(), b.indel_after());
+                    assert_eq!(a.record_idx(), b.record_idx());
+                    assert_eq!(a.flags, b.flags);
+                    assert_eq!(a.mapq, b.mapq);
+                    assert_eq!(a.seq_len, b.seq_len);
+                    assert_eq!(a.matching_bases, b.matching_bases);
+                    assert_eq!(a.indel_bases, b.indel_bases);
+                    assert_eq!(a.mate_idx(), b.mate_idx());
+                    assert_eq!(a.in_mate_overlap(), b.in_mate_overlap());
+                }
+            }
+            assert!(lazy.pileups_lazy_reference().is_none());
+        }
+    }
+}
+
 // ---- pileup.active_set + pileup.column_contents ----
 
 // r[verify pileup.active_set]

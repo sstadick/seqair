@@ -362,7 +362,7 @@ fn fill_entries<U>(
 pub struct PileupColumn<'eng, U = ()> {
     pos: Pos0,
     reference_base: Base,
-    matches_reference: bool,
+    matches_reference: Option<bool>,
     alignments: &'eng [PileupAlignment],
     store: &'eng RecordStore<U>,
 }
@@ -419,11 +419,16 @@ impl<'eng, U> PileupColumn<'eng, U> {
     /// as a [`PileupOp::Match`] with nothing inserted or deleted after it: the
     /// column carries no evidence of anything but the reference.
     ///
-    /// Known from building the column, so asking costs nothing; a caller that
-    /// drops such columns need not walk them to find out.
+    /// Precomputed by `pileups`. With `pileups_lazy_reference`, this scans the
+    /// column only when asked, avoiding work for callers that never use it.
     #[must_use]
     pub fn matches_reference(&self) -> bool {
-        self.matches_reference
+        self.matches_reference.unwrap_or_else(|| {
+            self.alignments.iter().all(|alignment| {
+                matches!(alignment.op, PileupOp::Match { base, .. } if base == self.reference_base)
+                    && alignment.indel_after == Indel::None
+            })
+        })
     }
 
     /// Borrow the record store for custom slab access (e.g., record fields by index).
@@ -902,9 +907,9 @@ impl<U> PileupEngine<U> {
     ///
     /// Takes a [`PileupInput`] rather than a [`RecordStore`] because the engine
     /// relies on ascending position order and linked mates and checks neither:
-    /// an unsorted store loses whole reads without reporting a gap, and an
-    /// unlinked one makes every alignment look like it has no mate. Only
-    /// [`RecordStore::prepare_for_pileup`] mints that type.
+    /// an unsorted store loses whole reads without reporting a gap. Use
+    /// [`RecordStore::prepare_for_pileup`] for linked mates, or the explicit
+    /// unlinked preparation methods when resolving mates yourself.
     ///
     /// `region` is the closed interval of positions to report columns for.
     // r[impl interval.span_type]
@@ -1191,6 +1196,12 @@ impl<U> PileupEngine<U> {
     /// non-empty column. Returns `(pos, reference_base)` so the caller
     /// can build a [`PileupColumn`] borrowing the buffer.
     pub(crate) fn advance(&mut self) -> Option<(Pos0, Base, bool)> {
+        self.advance_with_reference::<true>()
+    }
+
+    fn advance_with_reference<const CHECK_REFERENCE: bool>(
+        &mut self,
+    ) -> Option<(Pos0, Base, bool)> {
         loop {
             if self.current_pos > self.region_end {
                 return None;
@@ -1365,7 +1376,7 @@ impl<U> PileupEngine<U> {
             let spare = buf.spare_capacity_mut();
             let n_active = actives.len();
             if n_active <= cap {
-                matches_reference &= fill_entries(
+                let matched = fill_entries(
                     actives,
                     store,
                     spare,
@@ -1374,12 +1385,15 @@ impl<U> PileupEngine<U> {
                     soft_clip_overhang,
                     reference_base,
                 )?;
+                if CHECK_REFERENCE {
+                    matches_reference &= matched;
+                }
             } else {
                 let mut pass_start = 0usize;
                 let mut pass_end = cap;
                 loop {
                     let pass = actives.get_mut(pass_start..pass_end).unwrap_or_default();
-                    matches_reference &= fill_entries(
+                    let matched = fill_entries(
                         pass,
                         store,
                         spare,
@@ -1388,6 +1402,9 @@ impl<U> PileupEngine<U> {
                         soft_clip_overhang,
                         reference_base,
                     )?;
+                    if CHECK_REFERENCE {
+                        matches_reference &= matched;
+                    }
                     if written >= cap || pass_end >= n_active {
                         break;
                     }
@@ -1433,6 +1450,19 @@ impl<U> PileupEngine<U> {
         Some(self.column(step))
     }
 
+    // r[impl pileup.lazy_reference_check]
+    /// Advance without eagerly checking whether every base matches reference.
+    ///
+    /// Returns the same alignment fields as [`pileups`](Self::pileups).
+    /// `matches_reference()` remains available, but scans the column when
+    /// called. Use this for counting workloads that do not ask that question.
+    pub fn pileups_lazy_reference(&mut self) -> Option<PileupColumn<'_, U>> {
+        let step = self.advance_with_reference::<false>()?;
+        let mut column = self.column(step);
+        column.matches_reference = None;
+        Some(column)
+    }
+
     /// The column [`advance`](Self::advance) just filled. Split from
     /// [`pileups`](Self::pileups) so a caller that owns several engines in
     /// turn (the streaming pileup) can advance under `&mut` and return the
@@ -1445,7 +1475,7 @@ impl<U> PileupEngine<U> {
         PileupColumn {
             pos,
             reference_base,
-            matches_reference,
+            matches_reference: Some(matches_reference),
             alignments: &self.buf,
             store: &self.store,
         }

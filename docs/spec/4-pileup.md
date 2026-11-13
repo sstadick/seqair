@@ -182,6 +182,13 @@ skipped). The engine MUST compute it while writing the column's entries, not by
 a second pass over them: a caller that drops such columns (most of a genome)
 then pays nothing to find them.
 
+r[pileup.lazy_reference_check]
+`PileupEngine::pileups_lazy_reference` MUST yield the same columns and alignment
+fields as `pileups`, but MUST defer the reference-match comparison until
+`PileupColumn::matches_reference` is called. That accessor MUST remain exact,
+including indels and reference skips. The ordinary `pileups` path MUST keep its
+precomputed comparison for consumers that use it on every column.
+
 r[pileup.column_position_of]
 `PileupColumn::position_of(record_idx)` MUST return the index of that record's
 alignment in this column's order — the order `alignments` yields — or `None`

@@ -314,6 +314,14 @@ store that is empty or newly cleared MUST have it. Any mutation that appends or
 moves records MUST also mark mate links invalid, and `link_mates` MUST mark them
 valid.
 
+r[record_store.pileup_input.sequential]
+`prepare_for_sequential_pileup` MUST establish position order and clear mate
+links, but MUST NOT build the window-query index. It is intended for callers
+that walk every column and resolve mates themselves. Window queries on this
+input and its columns MUST still return the same records as indexed queries,
+using a linear scan instead. Reusing a previously indexed store MUST NOT expose
+a stale index. Existing preparation methods MUST retain indexed queries.
+
 r[record_store.dedup.orders_first]
 `dedup` collapses *consecutive* equal records, so duplicates must be adjacent,
 which they are only once the store is in position order. It MUST establish that
